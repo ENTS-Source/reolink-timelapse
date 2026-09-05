@@ -1,0 +1,4 @@
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+*/15 * * * * camera-timelapse set -a; . /etc/camera-timelapse.env; set +a; /usr/local/bin/camera-timelapse >> /var/lib/camera-timelapse/camera-timelapse.log 2>&1
