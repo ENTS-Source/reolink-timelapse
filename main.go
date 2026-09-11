@@ -26,11 +26,13 @@ const (
 	captureAttempts   = 3
 	captureTimeout    = 20 * time.Second
 	uploadTimeout     = 45 * time.Second
+	downloadTimeout   = 45 * time.Second
 	maxPendingPerRun  = 5
 	maxSnapshotSize   = 32 * 1024 * 1024 // 32 MiB
 	defaultWorkingDir = "/var/lib/camera-timelapse"
 	defaultTimezone   = "America/Edmonton"
 	defaultS3Region   = "us-east-1"
+	latestObjectKey   = "latest.jpg"
 )
 
 type appConfig struct {
@@ -52,7 +54,33 @@ type appConfig struct {
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 
-	cfg, err := loadConfig()
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "latest":
+			runDownloadLatest(os.Args[2:])
+			return
+		case "help", "-h", "--help":
+			printUsage()
+			return
+		default:
+			fmt.Fprintf(os.Stderr, "unknown command %q\n\n", os.Args[1])
+			printUsage()
+			os.Exit(2)
+		}
+	}
+
+	runCapture()
+}
+
+func printUsage() {
+	program := filepath.Base(os.Args[0])
+	fmt.Fprintf(os.Stderr, "Usage:\n")
+	fmt.Fprintf(os.Stderr, "  %s                 Capture and upload a new image\n", program)
+	fmt.Fprintf(os.Stderr, "  %s latest [path]   Download the latest image from S3 (default: latest.jpg)\n", program)
+}
+
+func runCapture() {
+	cfg, err := loadConfig(true)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -127,6 +155,17 @@ func main() {
 			continue
 		}
 
+		// Keep a fixed-key copy of the capture from this invocation. This
+		// makes retrieving the newest image O(1), regardless of how many
+		// historical snapshots are in the bucket.
+		if path == imagePath {
+			if err := uploadFileAsKeyAndVerify(s3Client, cfg, path, latestObjectKey); err != nil {
+				// The timestamped object is already safe in S3. A downloader
+				// can still fall back to finding the newest timestamped key.
+				log.Printf("uploaded %s but could not update %s: %v", filepath.Base(path), latestObjectKey, err)
+			}
+		}
+
 		if err := os.Remove(path); err != nil {
 			log.Printf(
 				"uploaded %s but could not remove local copy: %v",
@@ -140,7 +179,36 @@ func main() {
 	}
 }
 
-func loadConfig() (appConfig, error) {
+func runDownloadLatest(args []string) {
+	if len(args) > 1 {
+		printUsage()
+		os.Exit(2)
+	}
+
+	outputPath := latestObjectKey
+	if len(args) == 1 {
+		outputPath = args[0]
+	}
+
+	cfg, err := loadConfig(false)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	s3Client, err := newS3Client(cfg)
+	if err != nil {
+		log.Fatalf("configure S3 client: %v", err)
+	}
+
+	key, err := downloadLatestSnapshot(s3Client, cfg, outputPath)
+	if err != nil {
+		log.Fatalf("download latest image: %v", err)
+	}
+
+	log.Printf("downloaded s3://%s/%s to %s", cfg.s3Bucket, key, outputPath)
+}
+
+func loadConfig(requireCamera bool) (appConfig, error) {
 	cfg := appConfig{
 		cameraBaseURL:     strings.TrimRight(os.Getenv("CAMERA_BASE_URL"), "/"),
 		cameraUser:        os.Getenv("CAMERA_USER"),
@@ -158,13 +226,16 @@ func loadConfig() (appConfig, error) {
 	}
 
 	required := map[string]string{
-		"CAMERA_BASE_URL": cfg.cameraBaseURL,
-		"CAMERA_USER":     cfg.cameraUser,
-		"CAMERA_PASSWORD": cfg.cameraPassword,
-		"S3_ENDPOINT":     cfg.s3Endpoint,
-		"S3_BUCKET":       cfg.s3Bucket,
-		"S3_ACCESS_KEY":   cfg.s3AccessKey,
-		"S3_SECRET_KEY":   cfg.s3SecretKey,
+		"S3_ENDPOINT":   cfg.s3Endpoint,
+		"S3_BUCKET":     cfg.s3Bucket,
+		"S3_ACCESS_KEY": cfg.s3AccessKey,
+		"S3_SECRET_KEY": cfg.s3SecretKey,
+	}
+
+	if requireCamera {
+		required["CAMERA_BASE_URL"] = cfg.cameraBaseURL
+		required["CAMERA_USER"] = cfg.cameraUser
+		required["CAMERA_PASSWORD"] = cfg.cameraPassword
 	}
 
 	for name, value := range required {
@@ -173,9 +244,11 @@ func loadConfig() (appConfig, error) {
 		}
 	}
 
-	u, err := url.Parse(cfg.cameraBaseURL)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return cfg, fmt.Errorf("invalid CAMERA_BASE_URL %q", cfg.cameraBaseURL)
+	if requireCamera {
+		u, err := url.Parse(cfg.cameraBaseURL)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return cfg, fmt.Errorf("invalid CAMERA_BASE_URL %q", cfg.cameraBaseURL)
+		}
 	}
 
 	return cfg, nil
@@ -354,6 +427,10 @@ func captureSnapshot(cfg appConfig, outputPath string) (int, int, int64, error) 
 }
 
 func uploadAndVerify(client *s3.Client, cfg appConfig, path string) error {
+	return uploadFileAsKeyAndVerify(client, cfg, path, filepath.Base(path))
+}
+
+func uploadFileAsKeyAndVerify(client *s3.Client, cfg appConfig, path, key string) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -364,8 +441,6 @@ func uploadAndVerify(client *s3.Client, cfg appConfig, path string) error {
 	if err != nil {
 		return err
 	}
-
-	key := filepath.Base(path)
 
 	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
 	defer cancel()
@@ -378,7 +453,7 @@ func uploadAndVerify(client *s3.Client, cfg appConfig, path string) error {
 		ContentLength: aws.Int64(stat.Size()),
 	})
 	if err != nil {
-		return fmt.Errorf("PutObject: %w", err)
+		return fmt.Errorf("PutObject %q: %w", key, err)
 	}
 
 	head, err := client.HeadObject(ctx, &s3.HeadObjectInput{
@@ -386,22 +461,157 @@ func uploadAndVerify(client *s3.Client, cfg appConfig, path string) error {
 		Key:    aws.String(key),
 	})
 	if err != nil {
-		return fmt.Errorf("HeadObject verification: %w", err)
+		return fmt.Errorf("HeadObject verification %q: %w", key, err)
 	}
 
 	if head.ContentLength == nil {
-		return fmt.Errorf("HeadObject returned no Content-Length")
+		return fmt.Errorf("HeadObject %q returned no Content-Length", key)
 	}
 
 	if *head.ContentLength != stat.Size() {
 		return fmt.Errorf(
-			"uploaded size mismatch: local=%d remote=%d",
+			"uploaded size mismatch for %q: local=%d remote=%d",
+			key,
 			stat.Size(),
 			*head.ContentLength,
 		)
 	}
 
 	return nil
+}
+
+func downloadLatestSnapshot(client *s3.Client, cfg appConfig, outputPath string) (string, error) {
+	// New captures maintain this fixed key, making the normal path a single
+	// GetObject request.
+	if err := downloadS3Object(client, cfg, latestObjectKey, outputPath); err == nil {
+		return latestObjectKey, nil
+	} else {
+		log.Printf("could not download %s directly; searching timestamped snapshots: %v", latestObjectKey, err)
+	}
+
+	// Backward-compatible fallback for buckets populated before latest.jpg
+	// existed. This is intentionally only a fallback because listing a large
+	// timelapse bucket gets progressively more expensive.
+	key, err := findLatestSnapshotKey(client, cfg)
+	if err != nil {
+		return "", fmt.Errorf("find latest timestamped snapshot: %w", err)
+	}
+	if key == "" {
+		return "", fmt.Errorf("bucket contains no timestamped JPEG snapshots")
+	}
+
+	if err := downloadS3Object(client, cfg, key, outputPath); err != nil {
+		return "", fmt.Errorf("download fallback object %q: %w", key, err)
+	}
+
+	return key, nil
+}
+
+func downloadS3Object(client *s3.Client, cfg appConfig, key, outputPath string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), downloadTimeout)
+	defer cancel()
+
+	result, err := client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(cfg.s3Bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return fmt.Errorf("GetObject: %w", err)
+	}
+	defer result.Body.Close()
+
+	partPath := outputPath + ".part"
+	f, err := os.OpenFile(
+		partPath,
+		os.O_CREATE|os.O_WRONLY|os.O_TRUNC,
+		0600,
+	)
+	if err != nil {
+		return err
+	}
+
+	n, copyErr := io.Copy(f, io.LimitReader(result.Body, maxSnapshotSize+1))
+	closeErr := f.Close()
+
+	if copyErr != nil {
+		os.Remove(partPath)
+		return copyErr
+	}
+	if closeErr != nil {
+		os.Remove(partPath)
+		return closeErr
+	}
+	if n > maxSnapshotSize {
+		os.Remove(partPath)
+		return fmt.Errorf("downloaded snapshot exceeds maximum expected size")
+	}
+	if result.ContentLength != nil && n != *result.ContentLength {
+		os.Remove(partPath)
+		return fmt.Errorf("downloaded size mismatch: expected=%d received=%d", *result.ContentLength, n)
+	}
+
+	// Validate the completed download before replacing the destination.
+	checkFile, err := os.Open(partPath)
+	if err != nil {
+		os.Remove(partPath)
+		return err
+	}
+	_, err = jpeg.DecodeConfig(checkFile)
+	checkFile.Close()
+	if err != nil {
+		os.Remove(partPath)
+		return fmt.Errorf("downloaded object is not a valid JPEG: %w", err)
+	}
+
+	if err := os.Rename(partPath, outputPath); err != nil {
+		os.Remove(partPath)
+		return err
+	}
+
+	return nil
+}
+
+func findLatestSnapshotKey(client *s3.Client, cfg appConfig) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), downloadTimeout)
+	defer cancel()
+
+	paginator := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(cfg.s3Bucket),
+	})
+
+	latest := ""
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return "", err
+		}
+
+		for _, object := range page.Contents {
+			if object.Key == nil || !isTimestampedSnapshotKey(*object.Key) {
+				continue
+			}
+
+			if *object.Key > latest {
+				latest = *object.Key
+			}
+		}
+	}
+
+	return latest, nil
+}
+
+func isTimestampedSnapshotKey(key string) bool {
+	if !strings.HasSuffix(key, ".jpg") {
+		return false
+	}
+
+	underscore := strings.IndexByte(key, '_')
+	if underscore != 13 {
+		return false
+	}
+
+	_, err := strconv.ParseInt(key[:underscore], 10, 64)
+	return err == nil
 }
 
 func uploadQueue(workDir, current string, maximum int) ([]string, error) {
